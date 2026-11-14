@@ -9,7 +9,7 @@ import argparse, asyncio, collections, json, os, sys
 import numpy as np, websockets
 from scipy.signal import resample_poly
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path[:0] = [HERE, os.path.dirname(HERE)]
-from engine import Brain, Session, SR
+from engine import Brain, Session, SR, raise_qos
 from aec import Echo
 from adapt import InputGain, Playout
 
@@ -194,7 +194,7 @@ async def handle(ws):
             import time as _t; os.makedirs(a.dump_dir, exist_ok=True); stamp = _t.strftime("%H%M%S")
             for name, parts in (("mic", rec[0]), ("far", rec[1])):
                 np.save(os.path.join(a.dump_dir, f"{stamp}-{name}.npy"), np.concatenate(parts).astype(np.float32))
-        sender.cancel(); dog.cancel(); prober.cancel(); stater and stater.cancel(); busy = False
+        sender.cancel(); dog.cancel(); prober.cancel(); stater and stater.cancel(); sess.close(); busy = False
 
 
 async def main():
@@ -207,6 +207,7 @@ speaker = None
 if os.path.exists(a.speaker_model):
     from speaker import Speaker
     speaker = Speaker(a.speaker_model)
+raise_qos()                  # the event loop's thread too: it paces the reply audio
 print("Loading the model (first time ~1 min)...", flush=True)
 brain = Brain(a.root, lang=a.lang, voice=a.voice, sys_prompt=os.path.join(HERE, "system_prompt.json")); brain.warmup()
 try:
