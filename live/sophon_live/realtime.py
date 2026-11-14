@@ -23,7 +23,7 @@ import uuid
 import numpy as np
 import websockets
 
-from .adapters import VllmOmniAdapter
+from .adapters import VllmOmniAdapter, make_engine
 from . import grounding
 from . import backend
 
@@ -242,7 +242,7 @@ class RealtimeSession:
         if self.bo is not None and (tools or backend.ALL):
             tools = [backend.DELEGATE_TOOL]                     # the front only delegates; the back office holds the real tools
         if self.engine is None:
-            self.engine = VllmOmniAdapter(self.args.engine, self.args.bridge)
+            self.engine = make_engine(self.args)
             try:
                 await self.engine.start(instructions=self._sys(), voice=DEFAULT_VOICE, lang=self.lang, tools=tools, history=[])
             except Exception as e:  # noqa: BLE001
