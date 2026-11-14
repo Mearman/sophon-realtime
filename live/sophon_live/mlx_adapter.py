@@ -30,7 +30,8 @@ class MlxEngine:
         mac = os.environ.get("SOPHON_MAC_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "mac")
         if mac not in sys.path:
             sys.path.insert(0, mac)
-        from engine import Brain
+        from engine import Brain, raise_qos
+        raise_qos()                              # the gateway's own thread, which paces the audio
         cls.brain = Brain(root, lang=lang, voice=voice, sys_prompt=os.path.join(mac, "system_prompt.json"))
         cls.brain.warmup()
         cls.lang = lang
