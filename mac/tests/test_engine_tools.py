@@ -1,6 +1,6 @@
 """Tool round trips through Session with a scripted stand-in for the model (no weights are loaded). Needs MLX (Apple silicon) to import
 engine.py, so it is skipped elsewhere. Run from the repository root: python3 -m unittest discover -s mac/tests -q"""
-import json, os, queue, sys, threading, time, types, unittest
+import concurrent.futures, json, os, queue, sys, threading, time, types, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 try:
@@ -18,13 +18,19 @@ class FakeBrain:
     last_prefill = 0; timing = {}
 
     def __init__(self, script):
-        self.script = list(script); self.asked = []; self.tools = None
+        self.script = list(script); self.asked = []; self.tools = None; self.instructions = None; self.threads = []
+        self._ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def submit(self, fn, *args): return self._ex.submit(fn, *args)
 
     def set_tools(self, tools): self.tools = tools
 
-    def reply(self, history, user, emit, cancelled, max_tok=0, said=""):
-        self.asked.append({"user": user, "history": [dict(h) for h in history]})
+    def set_instructions(self, text): self.instructions = text
+
+    def reply(self, history, user, emit, cancelled, max_tok=0, said="", on_text=None):
+        self.asked.append({"user": user, "history": [dict(h) for h in history]}); self.threads.append(threading.current_thread())
         text, a, calls = self.script.pop(0)
+        if on_text is not None and text: on_text(text)
         if a is not None: emit(a)
         return text, a, [dict(c) for c in calls]
 
@@ -128,6 +134,17 @@ class ToolRoundTrip(unittest.TestCase):
         r = new_reply(); r["cancel"] = True; s.reply = r; s.jobs.put(("reply", r))
         self.wait_for("reply_done"); time.sleep(0.2); self.wait_for("reply_done")
         self.assertEqual([e for e in self.seen if e["ev"] == "tool_call"], [])
+
+    def test_every_conversation_runs_on_the_same_model_thread(self):
+        """MLX generation streams are thread-local: a second conversation on a new thread cannot use the first one's cache."""
+        brain = FakeBrain([("One.", AUDIO(), []), ("Two.", AUDIO(), [])]); events = queue.Queue()
+        for _ in range(2):
+            s = engine.Session(brain, lambda a: None, log=lambda m: events.put(json.loads(m)))
+            r = new_reply(); s.reply = r; s.jobs.put(("reply", r))
+            end = time.time() + 5
+            while time.time() < end and sum(1 for e in list(events.queue) if e["ev"] == "reply_done") < len(brain.threads): time.sleep(0.02)
+            s.close(); self.assertTrue(s.stopped.wait(5))
+        self.assertEqual(len(brain.threads), 2); self.assertEqual(len(set(brain.threads)), 1)
 
     def test_tools_are_cleared_for_a_session_without_them(self):
         self.session([]); b = FakeBrain([]); b.tools = ["stale"]

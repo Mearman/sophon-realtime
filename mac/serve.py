@@ -194,7 +194,7 @@ async def handle(ws):
             import time as _t; os.makedirs(a.dump_dir, exist_ok=True); stamp = _t.strftime("%H%M%S")
             for name, parts in (("mic", rec[0]), ("far", rec[1])):
                 np.save(os.path.join(a.dump_dir, f"{stamp}-{name}.npy"), np.concatenate(parts).astype(np.float32))
-        sender.cancel(); dog.cancel(); prober.cancel(); stater and stater.cancel(); busy = False
+        sender.cancel(); dog.cancel(); prober.cancel(); stater and stater.cancel(); sess.close(); busy = False
 
 
 async def main():

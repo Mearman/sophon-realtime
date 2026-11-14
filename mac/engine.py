@@ -2,7 +2,7 @@
 Hearing, turn-taking and replying are all done by our own model: the user's audio goes straight into the thinker through its own audio tower; whether the
 user has finished is the thinker's own answer to a turn question asked inside the reply's context (same check schedule and thresholds as the server),
 so the audio is computed once and the reply continues from the same cache."""
-import collections, hashlib, json, os, random, re, threading, time, uuid, queue
+import collections, concurrent.futures, hashlib, json, os, random, re, threading, time, uuid, queue
 import numpy as np, mlx.core as mx
 from mlx_lm import load as lm_load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
@@ -108,6 +108,12 @@ class Brain:
     """The three parts of the model on MLX. Used from ONE thread (the GPU worker)."""
 
     def __init__(self, root, lang="zh", voice="chelsie", sys_prompt=None):
+        # Everything that touches MLX, loading included, runs on one thread for the life of the process: MLX streams are thread-local, and arrays made
+        # on one thread cannot be evaluated on another.
+        self._exec = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sophon-model")
+        self.submit(self._load, root, lang, voice, sys_prompt).result()
+
+    def _load(self, root, lang, voice, sys_prompt):
         import os
         ex = lambda *p: next((os.path.join(root, x) for x in p if os.path.exists(os.path.join(root, x))), os.path.join(root, p[0]))
         self.lang = lang
@@ -124,14 +130,23 @@ class Brain:
         self.codec = mx.concatenate([ce([tc.codec_think_id, tc.codec_think_bos_id, lid, tc.codec_think_eos_id]), xv,
                                      ce([tc.codec_pad_id, tc.codec_bos_id])], 1)
         self.role = self.te(self.tts.tokenizer.encode("<|im_start|>assistant\n"))
-        self.cache = make_prompt_cache(self.lm); self.sig = []; self._emb = {}; self.tools = []
+        self.cache = make_prompt_cache(self.lm); self.sig = []; self._emb = {}; self.tools = []; self.instructions = None
+
+    def submit(self, fn, *args):
+        """Run fn on the model thread, after everything submitted before it. MLX generation streams are thread-local, so the weights' cache and the
+        streams must be used from one thread for the life of the process."""
+        return self._exec.submit(fn, *args)
 
     def set_tools(self, tools):
         """The tools the model may call (OpenAI Realtime or Chat Completions style definitions); an empty list turns tool calling off."""
         self.tools = normalize_tools(tools)
 
+    def set_instructions(self, text):
+        """The system prompt for the conversation (a client's own persona); None or empty goes back to the bundled one."""
+        self.instructions = (text or "").strip() or None
+
     def _system(self):
-        return self.SYS + ("\n\n" + SYS_TOOL[self.lang] if self.tools else "")
+        return (self.instructions or self.SYS) + ("\n\n" + SYS_TOOL[self.lang] if self.tools else "")
 
     def embed(self, key, a):
         if key not in self._emb:
@@ -219,7 +234,9 @@ class Brain:
         self._prefill(ids, E, sig, end)
         return end
 
-    def warmup(self):
+    def warmup(self): return self.submit(self._warmup).result()
+
+    def _warmup(self):
         a = np.zeros(SR, np.float32); self.turn_check("warm", a, ""); self.reply([], ("warm2", a), lambda x: None, lambda: False, max_tok=8)
         self.sig = []; self.cache = make_prompt_cache(self.lm)
         # keep the system prompt (and later the history) in the KV cache: each reply then only prefills the new speech
@@ -235,8 +252,9 @@ class Brain:
         self._emb.pop(k, None)
         return float(z[perm.index(0)]), float(z[perm.index(2)])
 
-    def reply(self, history, user, emit, cancelled, max_tok=MAX_REPLY_TOK, said=""):
-        """Thinker writes, talker speaks while it writes (proc.py rules: cleaned text, stable tokens only, LEAD tokens before the first chunk)."""
+    def reply(self, history, user, emit, cancelled, max_tok=MAX_REPLY_TOK, said="", on_text=None):
+        """Thinker writes, talker speaks while it writes (proc.py rules: cleaned text, stable tokens only, LEAD tokens before the first chunk).
+        on_text(delta), when given, receives the spoken text as it grows."""
         msgs, audios = self._conv(history)
         if user is not None: msgs.append({"role": "user", "content": "<|audio|>"}); audios.append(user)      # None: continue after a tool result
         ids, E, sig = self._layout(msgs, audios)
@@ -263,6 +281,7 @@ class Brain:
             if len(stable) > st["sent"]:
                 st["buf"] += [brain.te([t]) for t in stable[st["sent"]:]]; st["sent"] = len(stable)
             if fin: st["buf"].append(brain.eos); st["done"] = True
+            if on_text is not None and txt.startswith(st["clean"]) and len(txt) > len(st["clean"]): on_text(txt[len(st["clean"]):])
             st["clean"] = txt
 
         while not st["done"] and len(st["buf"]) < LEAD:
@@ -296,34 +315,49 @@ class Brain:
             except KeyboardInterrupt:
                 pass
         while not st["done"] and not cancelled(): pull()       # finish the text for the history even if the talker stopped early
+        gen.close()                                            # on this thread: a generator left open is finalised on whichever thread runs the garbage collector
         self.sig += [("gen", i) for i in range(st["ntok"])]
         calls = parse_tool_calls(st["raw"]) if has_tool(st["raw"]) else []
         return st["clean"] or ("" if calls else st["raw"]), (np.concatenate(out) if out else None), calls
+
+
+class _Jobs:
+    """The conversation's job queue: jobs run one after another on the Brain's model thread."""
+
+    def __init__(self, session): self.s = session
+    def put(self, job): self.s.b.submit(self.s._job, *job)
 
 
 class Session:
     """One conversation = the plugin's SophonBuffer logic: energy VAD on 20 ms frames, turn questions at 0.2/0.35/0.5/0.8/1.3/2.0 s of silence
     (thresholds 0.95..0.25), fallback at 2 s, merge-and-abort when the user resumes within 2 s of a reply, barge-in cuts the reply and the history."""
 
-    def __init__(self, brain, play, log=print, speaker=None, speaker_thr=0.5, dump_dir=None, tools=None, on_tool_call=None, tool_timeout=TOOL_TIMEOUT_S):
+    def __init__(self, brain, play, log=print, speaker=None, speaker_thr=0.5, dump_dir=None, tools=None, on_tool_call=None, tool_timeout=TOOL_TIMEOUT_S, on_text=None):
         """tools: definitions the model may call. on_tool_call(call) is called from the worker thread with {"id", "name", "arguments"} and must not block:
         the answer goes to tool_result(call_id, output) from any thread, within tool_timeout seconds."""
-        self.dump_dir = dump_dir; self.on_tool_call = on_tool_call; self.tool_timeout = tool_timeout; brain.set_tools(tools)
+        self.dump_dir = dump_dir; self.stopped = threading.Event(); self.on_tool_call = on_tool_call; self.on_text = on_text; self.tool_timeout = tool_timeout; brain.set_tools(tools)
         self.spk = speaker; self.spk_thr = speaker_thr; self.owner = None; self.owner_n = 0; self.uid = 0; self.spk_uid = -1
         self.bystander = False; self.quiet_ms = 0
-        self.b = brain; self.play = play; self.log = log; self.jobs = queue.Queue(); self.lock = threading.Lock()
+        self.b = brain; self.play = play; self.log = log; self.jobs = _Jobs(self); self.lock = threading.Lock()
         self.history = []; self.last_said = ""; self.noise = 0.003; self.floor = collections.deque(maxlen=200); self.floor_n = 0; self.gen = 0; self.sgen = 0; self._reset()
         self.far_hist = collections.deque([0.0] * 10, maxlen=10); self.played_s = 0.0; self.cut = None
         self.pre = bytearray(); self.prev_user = None; self.t_reply = 0.0; self.reply = None; self.events = []
-        threading.Thread(target=self._worker, daemon=True).start()
         if speaker is not None:
             self.spk_q = queue.Queue(); threading.Thread(target=self._speaker_worker, daemon=True).start()
+
+    def close(self):
+        """Ends the worker threads of a finished conversation and cancels the reply in progress. The Brain stays loaded for the next one."""
+        with self.lock:
+            if self.reply is not None: self.reply["cancel"] = True
+        self.jobs.put(("stop", None))
+        if self.spk is not None: self.spk_q.put((-1, np.zeros(0, np.float32)))
 
     def _speaker_worker(self):
         """Compares the voice of the utterance in progress with the owner's, off the model worker's thread (which may be busy for
         seconds with a reply). The first voice heard after connecting is the owner's; it is the one that said the wake word."""
         while True:
             uid, audio = self.spk_q.get()
+            if uid < 0: return
             try:
                 e = self.spk.embed(audio)
                 if e is None: continue
@@ -357,46 +391,47 @@ class Session:
     def ev(self, name, **kw):
         kw = {"ev": name, "t": round(time.time(), 3), **kw}; self.events.append(kw); self.log(json.dumps(kw, ensure_ascii=False))
 
-    def _worker(self):
-        while True:
-            kind, arg = self.jobs.get()
-            try:
-                if kind == "check" and arg[7] != self.sgen:
-                    continue                                       # the user spoke again or a reply already started: this check is stale, skip it
-                if kind == "check":
-                    k, audio, said, gen, thr, idx, t_sil, sg = arg
-                    t = time.time()
-                    if SHARED: pf, pb = self.b.turn_check_shared(list(self.history), (k, audio), cancel=lambda: sg != self.sgen,
-                                                                  full=self.cut is not None and time.time() - self.cut["t"] < BC_WINDOW + FALLBACK_S)
-                    else: pf, pb = self.b.turn_check(k, audio, said)
-                    if pf is None:
-                        with self.lock: self.inflight = False if self.inflight == k else self.inflight
-                        self.ev("turn_check_dropped", n=idx, tokens=self.b.last_prefill, sec=round(time.time() - t, 3)); continue
-                    with self.lock:
-                        stale = gen != self.gen; self.inflight = False if self.inflight == k else self.inflight
-                        r = self.reply
-                        if stale and sg == self.sgen and r is not None and not r.get("started") and r.get("sgen") == sg:
-                            r["ukey"], r["user"] = k, audio      # a reply was queued meanwhile (fallback): let it reuse this question's prefill
-                        if not stale:
-                            sil = time.time() - t_sil
-                            # the answer arrives later than on the server: judge it with the threshold for the silence we are at NOW,
-                            # and keep it, so that later check points with a lower threshold can still accept it without recomputing
-                            thr = min(thr, THRS[max([0] + [i for i, c in enumerate(CHECKS) if c <= sil])]); self.p_last = pf
-                            self.ckey = k; self.caudio = audio; self.cgen = gen; self.pb_last = pb; self.max_pf = max(self.max_pf, pf)
-                            if self._is_bc(pf, pb): self.pending = "resume"
-                            elif pf >= thr: self.pending = True
-                    self.ev("turn_check", n=idx, p_finished=round(pf, 3), p_backchannel=round(pb, 3), thr=thr, sec=round(time.time() - t, 3),
-                            after_silence_s=round(time.time() - t_sil, 3), stale=stale, decision="reply" if (pf >= thr and not stale) else "wait")
-                elif kind == "prep":
-                    k, audio, gen = arg
-                    if gen == self.gen:
-                        t = time.time(); n = self.b.prep(list(self.history), (k, audio)); self.ev("prep", tokens=self.b.last_prefill, sec=round(time.time() - t, 3))
-                elif kind == "reply":
-                    self._run_reply(arg)
-                elif kind == "resume":
-                    self._run_resume(arg)
-            except Exception as exc:  # noqa: BLE001
-                import traceback; self.ev("error", where=kind, err=repr(exc)[:300], tb=traceback.format_exc()[-800:])
+    def _job(self, kind, arg):
+        """One job (a turn check, a prefill, a reply) of this conversation. Every job of every conversation runs on the Brain's one model thread:
+        MLX generation streams are thread-local, so the cache a conversation leaves behind is unusable from any other thread."""
+        if kind == "stop": self.stopped.set(); return
+        try:
+            if kind == "check" and arg[7] != self.sgen:
+                return                                       # the user spoke again or a reply already started: this check is stale, skip it
+            if kind == "check":
+                k, audio, said, gen, thr, idx, t_sil, sg = arg
+                t = time.time()
+                if SHARED: pf, pb = self.b.turn_check_shared(list(self.history), (k, audio), cancel=lambda: sg != self.sgen,
+                                                              full=self.cut is not None and time.time() - self.cut["t"] < BC_WINDOW + FALLBACK_S)
+                else: pf, pb = self.b.turn_check(k, audio, said)
+                if pf is None:
+                    with self.lock: self.inflight = False if self.inflight == k else self.inflight
+                    self.ev("turn_check_dropped", n=idx, tokens=self.b.last_prefill, sec=round(time.time() - t, 3)); return
+                with self.lock:
+                    stale = gen != self.gen; self.inflight = False if self.inflight == k else self.inflight
+                    r = self.reply
+                    if stale and sg == self.sgen and r is not None and not r.get("started") and r.get("sgen") == sg:
+                        r["ukey"], r["user"] = k, audio      # a reply was queued meanwhile (fallback): let it reuse this question's prefill
+                    if not stale:
+                        sil = time.time() - t_sil
+                        # the answer arrives later than on the server: judge it with the threshold for the silence we are at NOW,
+                        # and keep it, so that later check points with a lower threshold can still accept it without recomputing
+                        thr = min(thr, THRS[max([0] + [i for i, c in enumerate(CHECKS) if c <= sil])]); self.p_last = pf
+                        self.ckey = k; self.caudio = audio; self.cgen = gen; self.pb_last = pb; self.max_pf = max(self.max_pf, pf)
+                        if self._is_bc(pf, pb): self.pending = "resume"
+                        elif pf >= thr: self.pending = True
+                self.ev("turn_check", n=idx, p_finished=round(pf, 3), p_backchannel=round(pb, 3), thr=thr, sec=round(time.time() - t, 3),
+                        after_silence_s=round(time.time() - t_sil, 3), stale=stale, decision="reply" if (pf >= thr and not stale) else "wait")
+            elif kind == "prep":
+                k, audio, gen = arg
+                if gen == self.gen:
+                    t = time.time(); n = self.b.prep(list(self.history), (k, audio)); self.ev("prep", tokens=self.b.last_prefill, sec=round(time.time() - t, 3))
+            elif kind == "reply":
+                self._run_reply(arg)
+            elif kind == "resume":
+                self._run_resume(arg)
+        except Exception as exc:  # noqa: BLE001
+            import traceback; self.ev("error", where=kind, err=repr(exc)[:300], tb=traceback.format_exc()[-800:])
 
     def _run_reply(self, r):
         t0 = time.time()
@@ -409,7 +444,7 @@ class Session:
             r["gen_s"] += len(a) / 24000; self.play(a)
 
         fe = r.get("followup")                      # an entry whose tool results are in: the reply continues it, with no new user audio
-        text, a24, calls = self.b.reply(self.history, None if fe is not None else (r["ukey"], r["user"]), emit, lambda: r["cancel"])
+        text, a24, calls = self.b.reply(self.history, None if fe is not None else (r["ukey"], r["user"]), emit, lambda: r["cancel"], on_text=self.on_text)
         r["text"] = text; r["a16"] = resample(a24, 24000, SR) if a24 is not None else None; r["done"] = True
         announce = []
         with self.lock:
@@ -440,10 +475,11 @@ class Session:
             except Exception as exc:  # noqa: BLE001
                 self.tool_result(c["id"], json.dumps({"error": f"the call could not be sent: {exc!r}"[:200]}))
 
-    def tool_result(self, call_id, output, timed_out=False):
+    def tool_result(self, call_id, output, timed_out=False, speak=True):
         """The client's answer to a tool call; callable from any thread. The result joins the turn in the history. When every call of the
         latest round is answered and nothing newer has happened (the turn is the latest, nobody is speaking, no reply is being generated)
-        the model continues with a spoken answer; otherwise the result is only part of what the model sees on the next turn."""
+        the model continues with a spoken answer; otherwise, or with speak=False (more results to come), the result is only part of what the
+        model sees on the next turn."""
         out = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
         with self.lock:
             hit = next(((e, st, i) for e in reversed(self.history) for st in e.get("steps") or [] for i, c in enumerate(st["calls"])
@@ -451,7 +487,7 @@ class Session:
             if hit is None: return False
             e, st, i = hit; st["results"][i] = out
             r0 = self.reply
-            follow = (all(x is not None for x in st["results"]) and st is e["steps"][-1] and self.history[-1] is e and not e.get("a_text")
+            follow = (speak and all(x is not None for x in st["results"]) and st is e["steps"][-1] and self.history[-1] is e and not e.get("a_text")
                       and self.speech_ms == 0 and not self.bystander and (r0 is None or r0.get("done")))
             if follow:
                 r = {"user": None, "ukey": None, "followup": e, "entry": e, "cancel": False, "done": False, "gen_s": 0.0, "t_sil": time.time(),
