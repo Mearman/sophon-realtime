@@ -38,7 +38,7 @@ fi
 [ -x "$UV" ] || die "could not install uv."
 [ -x "$H/.venv/bin/python" ] || "$UV" venv -q --python 3.12 "$H/.venv"
 "$UV" pip install -q --python "$H/.venv/bin/python" "mlx>=0.29" "mlx-lm>=0.28" "mlx-audio==0.6.5" livekit sounddevice soundfile scipy numpy websockets \
-  "transformers>=4.57" huggingface_hub modelscope
+  "transformers>=4.57" huggingface_hub modelscope aiohttp onnxruntime
 
 # --- code ------------------------------------------------------------------------------------------------------------------------------
 say "Program files"

@@ -25,7 +25,7 @@ import websockets
 from websockets.http11 import Response
 from websockets.datastructures import Headers
 
-from .adapters import VllmOmniAdapter
+from .adapters import VllmOmniAdapter, make_engine
 from .realtime import RealtimeSession
 
 log = logging.getLogger("sophon_live")
@@ -212,7 +212,7 @@ class LiveSession:
         voice = (sess.get("audio") or {}).get("output", {}).get("voice") or "marin"
         delegation = sess.get("delegation") or {}
         tools = [DELEGATE[self.lang]] if delegation.get("type") == "client" else []
-        self.engine = VllmOmniAdapter(self.args.engine, self.args.bridge)
+        self.engine = make_engine(self.args)
         try:
             await self.engine.start(instructions=self._sys(), voice=os.environ.get(f"SOPHON_LIVE_VOICE_{voice.upper()}", DEFAULT_VOICE),
                                     lang=self.lang, tools=tools, history=hist)
@@ -611,9 +611,18 @@ def main() -> None:
     ap.add_argument("--bridge", default="http://127.0.0.1:8700")
     ap.add_argument("--asr", default=os.environ.get("SOPHON_LIVE_ASR", "Qwen/Qwen3-ASR-0.6B-hf"))
     ap.add_argument("--path", default="/v1/live/sessions")
+    ap.add_argument("--mlx-root", default=os.environ.get("SOPHON_MODELS", os.path.expanduser("~/sophon-mac/models")), help="--engine mlx: the Mac install's model directory")
+    ap.add_argument("--mlx-lang", default=os.environ.get("SOPHON_LIVE_LANG", "en"), help="--engine mlx: the language the model is loaded for (zh or en)")
+    ap.add_argument("--mlx-voice", default="chelsie", help="--engine mlx: one of the built-in voices")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    asr = ASR(args.asr) if args.asr else None
+    if args.engine == "mlx":                                    # the Mac engine runs in this process: load it before serving
+        from .mlx_adapter import MLX_ASR_DEFAULT, MlxASR, MlxEngine
+        MlxEngine.load(args.mlx_root, args.mlx_lang, args.mlx_voice)
+        os.environ.setdefault("SOPHON_LIVE_LANG", args.mlx_lang)
+        asr = MlxASR(MLX_ASR_DEFAULT if args.asr == "Qwen/Qwen3-ASR-0.6B-hf" else args.asr) if args.asr else None
+    else:
+        asr = ASR(args.asr) if args.asr else None
     if asr is not None:
         asr(np.zeros(16000, np.float32))                         # warm up
     asr_lock = asyncio.Lock()

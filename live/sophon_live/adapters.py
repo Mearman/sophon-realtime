@@ -23,6 +23,14 @@ import websockets
 log = logging.getLogger("sophon_live.adapter")
 
 
+def make_engine(args):
+    """The engine for one session: the Mac engine in this process (--engine mlx) or a vLLM-Omni engine behind a socket and the tool bridge."""
+    if args.engine == "mlx":
+        from .mlx_adapter import MlxAdapter
+        return MlxAdapter()
+    return VllmOmniAdapter(args.engine, args.bridge)
+
+
 class VllmOmniAdapter:
     """Sophon-Realtime served by vLLM-Omni (/v1/realtime + the plugin's client tool bridge)."""
 

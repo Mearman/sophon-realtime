@@ -40,6 +40,19 @@ The conversation ends by itself: `--followup` seconds after a reply has played (
 
 Optionally the server answers only the voice that woke the device: with the WeSpeaker ONNX model present (`"$HOME/sophon-mac/.venv/bin/hf" download Wespeaker/wespeaker-voxceleb-resnet34-LM voxceleb_resnet34_LM.onnx --local-dir "$HOME/sophon-mac/models/speaker"` and `uv pip install onnxruntime` into the same environment), the first voice heard after connecting is taken as the owner, and speech in other voices (a television, bystanders) starts no reply, does not keep the conversation open, and a reply it cut off is resumed. `--speaker-threshold` sets the similarity score, and `--dump-dir` keeps the audio behind each verdict to calibrate it. The model's licence is CC BY 4.0.
 
+## Live mode and tool calling
+
+`start_live.sh` runs the Live gateway (`live/sophon_live`: GPT-Live at `/v1/live/sessions` and OpenAI Realtime at `/v1/realtime`, as in [live/README.md](../live/README.md)) in front of the Mac engine in one process, so a GPT-Live, Pipecat or LiveKit client works against a Mac, with tool calling and delegation to a larger backend model (`SOPHON_LIVE_BACKEND*`):
+
+```bash
+bash mac/start_live.sh                 # English model, gateway on 127.0.0.1:8780
+LANG_=zh LIVE_PORT=8780 bash mac/start_live.sh
+```
+
+The model holds one conversation at a time and keeps the language and voice it was loaded with. The input transcript uses Qwen3-ASR from mlx-audio (`SOPHON_LIVE_ASR`, default `mlx-community/Qwen3-ASR-0.6B-8bit`) instead of the transformers model, which needs CUDA. A history sent at the start of a session is ignored.
+
+In Python, `Session(brain, play, tools=[...], on_tool_call=fn)` takes OpenAI Realtime or Chat Completions style tool definitions. `fn(call)` gets `{"id", "name", "arguments"}` and must not block; the answer goes to `session.tool_result(call["id"], output)` from any thread, and the model continues with a spoken answer. `python mac/tests/check_tools_with_model.py` exercises it against the weights, and `python3 -m unittest discover -s mac/tests` runs the rest.
+
 ## Speed (M4 Max, 36 GB)
 | | |
 |---|---|
@@ -61,4 +74,4 @@ which is what takes most of the time; chips with more GPU cores (Max / Ultra) ar
 ## Status and limits
 - Tested on an M4 Max (36 GB) with real-time simulated audio input (speech played into the engine at real-time pace, simulated room echo).
   Live microphone runs and numbers from other Macs are very welcome in [issue #1](https://github.com/adventists-ai/sophon-realtime/issues/1).
-- One conversation at a time. Camera input, tool calls and zero-shot voice cloning are not in the Mac version yet (built-in voices only).
+- One conversation at a time. Camera input and zero-shot voice cloning are not in the Mac version yet (built-in voices only).
