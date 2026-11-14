@@ -9,7 +9,7 @@ import argparse, asyncio, collections, json, os, sys
 import numpy as np, websockets
 from scipy.signal import resample_poly
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path[:0] = [HERE, os.path.dirname(HERE)]
-from engine import Brain, Session, SR
+from engine import Brain, Session, SR, raise_qos
 from aec import Echo
 from adapt import InputGain, Playout
 
@@ -207,6 +207,7 @@ speaker = None
 if os.path.exists(a.speaker_model):
     from speaker import Speaker
     speaker = Speaker(a.speaker_model)
+raise_qos()                  # the event loop's thread too: it paces the reply audio
 print("Loading the model (first time ~1 min)...", flush=True)
 brain = Brain(a.root, lang=a.lang, voice=a.voice, sys_prompt=os.path.join(HERE, "system_prompt.json")); brain.warmup()
 try:

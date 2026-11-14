@@ -146,6 +146,14 @@ class ToolRoundTrip(unittest.TestCase):
             s.close(); self.assertTrue(s.stopped.wait(5))
         self.assertEqual(len(brain.threads), 2); self.assertEqual(len(set(brain.threads)), 1)
 
+    def test_the_quality_of_service_class_can_be_raised_on_a_thread(self):
+        errors = []
+        def run():
+            try: engine.raise_qos()
+            except OSError as exc: errors.append(exc)
+        t = threading.Thread(target=run); t.start(); t.join(5)
+        self.assertEqual(errors, [])
+
     def test_tools_are_cleared_for_a_session_without_them(self):
         self.session([]); b = FakeBrain([]); b.tools = ["stale"]
         engine.Session(b, lambda a: None, log=lambda m: None)

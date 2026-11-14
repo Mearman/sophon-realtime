@@ -99,6 +99,14 @@ def tag_clean(s, final):
     return "".join(out)
 
 
+def raise_qos():
+    """Puts the calling thread in macOS's highest quality-of-service class (user interactive): the scheduler runs it ahead of the background work of a
+    shared machine and prefers a performance core for it. It needs no privileges. A model step that waits a second is a second of silence in the reply."""
+    import ctypes
+    r = ctypes.CDLL(None).pthread_set_qos_class_self_np(0x21, 0)
+    if r != 0: raise OSError(r, "could not set the quality-of-service class")
+
+
 def resample(a, si, so):
     n = int(round(len(a) * so / si))
     return np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype(np.float32) if n > 1 else a
@@ -110,7 +118,7 @@ class Brain:
     def __init__(self, root, lang="zh", voice="chelsie", sys_prompt=None):
         # Everything that touches MLX, loading included, runs on one thread for the life of the process: MLX streams are thread-local, and arrays made
         # on one thread cannot be evaluated on another.
-        self._exec = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sophon-model")
+        self._exec = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sophon-model", initializer=raise_qos)
         self.submit(self._load, root, lang, voice, sys_prompt).result()
 
     def _load(self, root, lang, voice, sys_prompt):
