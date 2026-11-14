@@ -7,6 +7,7 @@ import numpy as np, mlx.core as mx
 from mlx_lm import load as lm_load, stream_generate
 from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 from mlx_lm.sample_utils import make_sampler
+from tools import MAX_STEPS, SYS_TOOL, TC_CLOSE, cut_tool, flatten, has_tool, normalize_tools, parse_tool_calls
 from mlx_audio.tts.utils import load_model as tts_load
 from mlx_ear import load_ear, embed_audio
 
@@ -20,6 +21,7 @@ HIST_TURNS = 8; HIST_SEC = 120.0; LEAD = int(__import__("os").environ.get("SOPHO
 SPK_CHECK_MS = 900          # speech this long is compared with the owner's voice (a shorter stretch gives too noisy an embedding)
 OWNER_N = 5                 # the owner's voice is the mean of up to this many of their utterances
 BYSTANDER_QUIET_MS = 600    # after speech that is not the owner's, input is ignored until the room has been this quiet
+TOOL_TIMEOUT_S = 20.0      # a tool call the client has not answered by then gets an error result, so the model can tell the user
 NOISE_CAP = 0.02   # the ambient-floor estimate never rises above this RMS, so speech is still detectable in a loud room
 ECHO_K_START, ECHO_K, ECHO_ADAPT_S = 0.5, 0.12, 3.0   # speech threshold while playing = k x playback loudness (see Session.feed)
 BC_RESUME, BC_THR, BC_WINDOW = True, 0.5, 4.0   # user only says "mm-hmm" over a reply that got cut: continue that reply (as the server)
@@ -122,7 +124,14 @@ class Brain:
         self.codec = mx.concatenate([ce([tc.codec_think_id, tc.codec_think_bos_id, lid, tc.codec_think_eos_id]), xv,
                                      ce([tc.codec_pad_id, tc.codec_bos_id])], 1)
         self.role = self.te(self.tts.tokenizer.encode("<|im_start|>assistant\n"))
-        self.cache = make_prompt_cache(self.lm); self.sig = []; self._emb = {}
+        self.cache = make_prompt_cache(self.lm); self.sig = []; self._emb = {}; self.tools = []
+
+    def set_tools(self, tools):
+        """The tools the model may call (OpenAI Realtime or Chat Completions style definitions); an empty list turns tool calling off."""
+        self.tools = normalize_tools(tools)
+
+    def _system(self):
+        return self.SYS + ("\n\n" + SYS_TOOL[self.lang] if self.tools else "")
 
     def embed(self, key, a):
         if key not in self._emb:
@@ -131,7 +140,11 @@ class Brain:
 
     def _layout(self, msgs, audios):
         """Chat template -> token ids, input embeddings and a signature (audio tokens identified by clip key) for KV-cache reuse."""
-        s = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False)
+        kw = dict(add_generation_prompt=True, tokenize=False, enable_thinking=False)
+        if self.tools:
+            s = self.tok.apply_chat_template(msgs, tools=self.tools, **kw)
+            if "<tools>" not in s: s = self.tok.apply_chat_template(flatten(msgs, self.tools), **kw)       # a template that ignores tools=
+        else: s = self.tok.apply_chat_template(msgs, **kw)
         parts = s.split("<|audio|>"); ids, sig, embs = [], [], []
         for i, p in enumerate(parts):
             t = self.tok.encode(p, add_special_tokens=False)
@@ -159,10 +172,18 @@ class Brain:
         return out[0, -1]
 
     def _conv(self, history):
-        msgs = [{"role": "system", "content": self.SYS}]; audios = []
+        msgs = [{"role": "system", "content": self._system()}]; audios = []
         for h in history:
             msgs.append({"role": "user", "content": "<|audio|>"}); audios.append((h["ukey"], h["user"]))
-            if h.get("a_audio") is not None:
+            for st in h.get("steps") or []:        # tool rounds of this turn: the call is shown to the model as text, with its result
+                done = [(c, r) for c, r in zip(st["calls"], st["results"]) if r is not None]
+                m = {"role": "assistant", "content": st["text"]}
+                if done: m["tool_calls"] = [{"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}} for c, _ in done]
+                if m["content"] or done: msgs.append(m)
+                msgs += [{"role": "tool", "tool_call_id": c["id"], "content": r} for c, r in done]
+            if h.get("steps"):
+                if h.get("a_text"): msgs.append({"role": "assistant", "content": h["a_text"]})
+            elif h.get("a_audio") is not None:
                 msgs.append({"role": "assistant", "content": "<|audio|>"}); audios.append((h["akey"], h["a_audio"]))
             elif h.get("a_text"):
                 msgs.append({"role": "assistant", "content": h["a_text"]})
@@ -202,7 +223,7 @@ class Brain:
         a = np.zeros(SR, np.float32); self.turn_check("warm", a, ""); self.reply([], ("warm2", a), lambda x: None, lambda: False, max_tok=8)
         self.sig = []; self.cache = make_prompt_cache(self.lm)
         # keep the system prompt (and later the history) in the KV cache: each reply then only prefills the new speech
-        ids, E, sig = self._layout([{"role": "system", "content": self.SYS}, {"role": "user", "content": "<|audio|>"}], [("warm3", a)])
+        ids, E, sig = self._layout([{"role": "system", "content": self._system()}, {"role": "user", "content": "<|audio|>"}], [("warm3", a)])
         n = sig.index(("warm3", 0)) if ("warm3", 0) in sig else 0
         self.lm(mx.array([ids[:n]]), cache=self.cache, input_embeddings=E[:n][None]); mx.eval([c.state for c in self.cache]); self.sig = sig[:n]
         self._emb.clear()
@@ -217,7 +238,7 @@ class Brain:
     def reply(self, history, user, emit, cancelled, max_tok=MAX_REPLY_TOK, said=""):
         """Thinker writes, talker speaks while it writes (proc.py rules: cleaned text, stable tokens only, LEAD tokens before the first chunk)."""
         msgs, audios = self._conv(history)
-        msgs.append({"role": "user", "content": "<|audio|>"}); audios.append(user)
+        if user is not None: msgs.append({"role": "user", "content": "<|audio|>"}); audios.append(user)      # None: continue after a tool result
         ids, E, sig = self._layout(msgs, audios)
         if said:                                   # resume: what was already spoken starts the assistant turn, the model simply continues it
             t = self.tok.encode(said, add_special_tokens=False); ids = ids + t; sig = sig + t
@@ -236,7 +257,8 @@ class Brain:
                 if st["ntok"] == 1: brain.timing["tok1"] = round(time.time() - t0, 3)
             except StopIteration:
                 fin = True
-            txt = tag_clean(st["raw"], fin).lstrip(); tid = brain.tok.encode(txt, add_special_tokens=False) if txt else []
+            if not fin and TC_CLOSE in st["raw"]: fin = True        # the call is complete: nothing after it is spoken
+            txt = tag_clean(cut_tool(st["raw"], fin), fin).lstrip(); tid = brain.tok.encode(txt, add_special_tokens=False) if txt else []
             stable = tid if fin else tid[:-1]
             if len(stable) > st["sent"]:
                 st["buf"] += [brain.te([t]) for t in stable[st["sent"]:]]; st["sent"] = len(stable)
@@ -275,15 +297,18 @@ class Brain:
                 pass
         while not st["done"] and not cancelled(): pull()       # finish the text for the history even if the talker stopped early
         self.sig += [("gen", i) for i in range(st["ntok"])]
-        return st["clean"] or st["raw"], (np.concatenate(out) if out else None)
+        calls = parse_tool_calls(st["raw"]) if has_tool(st["raw"]) else []
+        return st["clean"] or ("" if calls else st["raw"]), (np.concatenate(out) if out else None), calls
 
 
 class Session:
     """One conversation = the plugin's SophonBuffer logic: energy VAD on 20 ms frames, turn questions at 0.2/0.35/0.5/0.8/1.3/2.0 s of silence
     (thresholds 0.95..0.25), fallback at 2 s, merge-and-abort when the user resumes within 2 s of a reply, barge-in cuts the reply and the history."""
 
-    def __init__(self, brain, play, log=print, speaker=None, speaker_thr=0.5, dump_dir=None):
-        self.dump_dir = dump_dir
+    def __init__(self, brain, play, log=print, speaker=None, speaker_thr=0.5, dump_dir=None, tools=None, on_tool_call=None, tool_timeout=TOOL_TIMEOUT_S):
+        """tools: definitions the model may call. on_tool_call(call) is called from the worker thread with {"id", "name", "arguments"} and must not block:
+        the answer goes to tool_result(call_id, output) from any thread, within tool_timeout seconds."""
+        self.dump_dir = dump_dir; self.on_tool_call = on_tool_call; self.tool_timeout = tool_timeout; brain.set_tools(tools)
         self.spk = speaker; self.spk_thr = speaker_thr; self.owner = None; self.owner_n = 0; self.uid = 0; self.spk_uid = -1
         self.bystander = False; self.quiet_ms = 0
         self.b = brain; self.play = play; self.log = log; self.jobs = queue.Queue(); self.lock = threading.Lock()
@@ -383,22 +408,62 @@ class Session:
                 r["t_out"] = time.time(); self.ev("first_audio", after_silence_s=round(r["t_out"] - r["t_sil"], 3), prefill_tok=self.b.last_prefill, since_start=round(r["t_out"] - t0, 3), **self.b.timing)
             r["gen_s"] += len(a) / 24000; self.play(a)
 
-        text, a24 = self.b.reply(self.history, (r["ukey"], r["user"]), emit, lambda: r["cancel"])
+        fe = r.get("followup")                      # an entry whose tool results are in: the reply continues it, with no new user audio
+        text, a24, calls = self.b.reply(self.history, None if fe is not None else (r["ukey"], r["user"]), emit, lambda: r["cancel"])
         r["text"] = text; r["a16"] = resample(a24, 24000, SR) if a24 is not None else None; r["done"] = True
+        announce = []
         with self.lock:
             if not r["cancel"]:
-                self._commit(r, r["a16"], text); self.last_said = text
+                if calls and (fe is None or len(fe["steps"]) < MAX_STEPS):
+                    if fe is None: self._commit(r, None, ""); fe = r["entry"]; fe["steps"] = []
+                    fe["steps"].append({"text": text, "calls": calls, "results": [None] * len(calls)}); announce = calls
+                elif fe is not None: fe["a_text"] = text; fe["a_audio"] = None
+                else: self._commit(r, r["a16"], text)
+                self.last_said = text
             elif r.get("cut") is not None and r.get("entry") is None:      # barged in while still generating: keep what was actually heard
                 played, frac = r["cut"]; said = text[: int(len(text) * frac)]
                 a16 = r["a16"][: int(played * SR)] if r["a16"] is not None and played > 0.5 else None
                 if said or a16 is not None: self._commit(r, a16, said + "……（被用户打断）")
                 self.last_said = said
-        self.ev("reply_done", text=text, audio_s=round(r["gen_s"], 2), cancelled=r["cancel"], sec=round(time.time() - t0, 2), hist=len(self.history))
+        self.ev("reply_done", text=text, audio_s=round(r["gen_s"], 2), cancelled=r["cancel"], sec=round(time.time() - t0, 2), hist=len(self.history), tool_calls=len(announce))
+        if announce: self._announce(announce)
+
+    def _announce(self, calls):
+        """Hand the calls to the client. A call the client does not answer in time gets an error result, so the turn is never left hanging."""
+        ids = [c["id"] for c in calls]
+        t = threading.Timer(self.tool_timeout, lambda: [self.tool_result(i, json.dumps({"error": "the tool did not answer in time"}), timed_out=True) for i in ids])
+        t.daemon = True; t.start()
+        for c in calls:
+            self.ev("tool_call", call_id=c["id"], tool=c["name"], arguments=c["arguments"])
+            try:
+                if self.on_tool_call is not None: self.on_tool_call(dict(c))
+            except Exception as exc:  # noqa: BLE001
+                self.tool_result(c["id"], json.dumps({"error": f"the call could not be sent: {exc!r}"[:200]}))
+
+    def tool_result(self, call_id, output, timed_out=False):
+        """The client's answer to a tool call; callable from any thread. The result joins the turn in the history. When every call of the
+        latest round is answered and nothing newer has happened (the turn is the latest, nobody is speaking, no reply is being generated)
+        the model continues with a spoken answer; otherwise the result is only part of what the model sees on the next turn."""
+        out = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+        with self.lock:
+            hit = next(((e, st, i) for e in reversed(self.history) for st in e.get("steps") or [] for i, c in enumerate(st["calls"])
+                        if c["id"] == call_id and st["results"][i] is None), None)
+            if hit is None: return False
+            e, st, i = hit; st["results"][i] = out
+            r0 = self.reply
+            follow = (all(x is not None for x in st["results"]) and st is e["steps"][-1] and self.history[-1] is e and not e.get("a_text")
+                      and self.speech_ms == 0 and not self.bystander and (r0 is None or r0.get("done")))
+            if follow:
+                r = {"user": None, "ukey": None, "followup": e, "entry": e, "cancel": False, "done": False, "gen_s": 0.0, "t_sil": time.time(),
+                     "t_out": None, "sgen": self.sgen}
+                self.reply = r; self.prev_user = None; self.t_reply = time.time(); self.jobs.put(("reply", r))
+        self.ev("tool_result", call_id=call_id, timed_out=timed_out, followup=follow, chars=len(out))
+        return True
 
     def _is_bc(self, pf, pb, extra=0.0):
         """The user only back-channelled ("mm-hmm", "yeah") right after cutting a reply: continue that reply instead of answering."""
         c = self.cut
-        return (BC_RESUME and c is not None and c["r"].get("entry") is not None and time.time() - c["t"] < BC_WINDOW + extra
+        return (BC_RESUME and c is not None and c["r"].get("entry") is not None and not c["r"]["entry"].get("steps") and time.time() - c["t"] < BC_WINDOW + extra
                 and self.speech_ms < 1500 and pb >= BC_THR and pb > pf)
 
     def _run_resume(self, r):
@@ -410,7 +475,7 @@ class Session:
                 r["t_out"] = time.time(); self.ev("first_audio", after_silence_s=round(r["t_out"] - r["t_sil"], 3), prefill_tok=self.b.last_prefill, resume=True)
             r["gen_s"] += len(a) / 24000; self.play(a)
         hist = [h for h in self.history if h is not e]
-        text, a24 = self.b.reply(hist, (e["ukey"], e["user"]), emit, lambda: r["cancel"], said=said)
+        text, a24, _ = self.b.reply(hist, (e["ukey"], e["user"]), emit, lambda: r["cancel"], said=said)
         r["text"] = text; r["done"] = True
         with self.lock:
             if any(h is e for h in self.history):    # identity: entries hold numpy arrays, == would compare them
@@ -420,6 +485,10 @@ class Session:
         self.ev("reply_done", text=text, resumed_from=said[-30:], cancelled=r["cancel"], sec=round(time.time() - t0, 2), hist=len(self.history))
 
     def _commit(self, r, a16, text):
+        if r.get("followup") is not None:                # a cut follow-up: what was heard becomes the entry's answer
+            e = r["followup"]; e["a_text"] = text; e["a_audio"] = None; r["entry"] = e
+            if not any(h is e for h in self.history): self.history.append(e)
+            return
         e = {"user": r["user"], "ukey": r["ukey"], "a_audio": a16, "akey": uuid.uuid4().hex, "a_text": text}
         r["entry"] = e; self.history.append(e)
         while len(self.history) > HIST_TURNS or sum(len(h["user"]) + (len(h["a_audio"]) if h["a_audio"] is not None else 0) for h in self.history) / SR > HIST_SEC:
@@ -505,7 +574,7 @@ class Session:
             if self.prev_user is not None and now - self.t_reply < MERGE_WINDOW:
                 # user resumed right after we started replying: we cut in too early -> abort that reply and merge the speech into this turn
                 r["cancel"] = True; self.play(None); self.utt.extend(self.prev_user.tobytes())
-                if r.get("entry") is not None: self.history = [h for h in self.history if h is not r["entry"]]   # by identity (entries hold arrays)
+                if r.get("entry") is not None and not r.get("followup"): self.history = [h for h in self.history if h is not r["entry"]]   # by identity (entries hold arrays)
                 self.ev("merge_abort", since_reply_s=round(now - self.t_reply, 2))
             elif r["t_out"] is not None and r.get("resume") is not None:
                 # cut again while continuing a reply: keep the original history entry; _run_resume writes what was actually said into it
@@ -516,7 +585,7 @@ class Session:
                 played = now - r["t_out"] - 0.25
                 r["cancel"] = True; self.play(None)
                 txt = r.get("text") or ""; said = txt[: int(len(txt) * max(0.0, min(1.0, played / max(r["gen_s"], 1e-3))))]
-                if r.get("entry") is not None: self.history = [h for h in self.history if h is not r["entry"]]   # by identity (entries hold arrays)
+                if r.get("entry") is not None and not r.get("followup"): self.history = [h for h in self.history if h is not r["entry"]]   # by identity (entries hold arrays)
                 r["cut"] = (max(played, 0.0), max(0.0, min(1.0, played / max(r["gen_s"], 1e-3))))
                 if r["done"]:
                     a16 = r.get("a16"); a16 = a16[: int(max(played, 0) * SR)] if a16 is not None and played > 0.5 else None
